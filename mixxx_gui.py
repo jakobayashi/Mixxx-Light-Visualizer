@@ -122,6 +122,7 @@ class MixxxGUI:
             ("Beat RGB step", light_controller.LightMode.BEAT_RGB_STEP.value),
             ("Slider slow fade", light_controller.LightMode.SLIDER_SLOW_FADE.value),
             ("Beat every 4th", light_controller.LightMode.FADE_SYNC_EVERY_4.value),
+            ("Strobe", light_controller.LightMode.STROBE.value),
         ]
         for idx, (label, mode) in enumerate(mode_options):
             row, col = divmod(idx, 3)
@@ -335,6 +336,8 @@ class MixxxGUI:
             self.set_status("Slider color slow fade (no beat)")
         elif mode == light_controller.LightMode.FADE_SYNC_EVERY_4:
             self.set_status("Beat fade every 4th beat")
+        elif mode == light_controller.LightMode.STROBE:
+            self.set_status("Strobe: rapid flashes (0ms in / 20ms out)")
 
     def _on_decay_change(self, value: float) -> None:
         val = max(0.0, min(float(value), 5000.0))

@@ -19,6 +19,7 @@ class LightMode(Enum):
     BEAT_RGB_STEP = "beat_rgb_step"
     SLIDER_SLOW_FADE = "slider_slow_fade"
     FADE_SYNC_EVERY_4 = "fade_sync_every_4"
+    STROBE = "strobe"
 
 
 class LightController:
@@ -48,6 +49,9 @@ class LightController:
         self._cycle_fade_out_ms: int = 800
         self._slider_fade_interval_sec: float = 2.5
         self._slider_fade_duration_ms: int = 1200
+        self._strobe_interval_sec: float = 0.05
+        self._strobe_fade_in_ms: int = 0
+        self._strobe_fade_out_ms: int = 25
 
     # ------------------------------ lifecycle ------------------------------ #
     def close(self) -> None:
@@ -88,7 +92,7 @@ class LightController:
         elif mode == LightMode.FADE_SYNC:
             # No immediate action; beat pulses will trigger fades.
             pass
-        elif mode in (LightMode.AUTO_RGB_FADE, LightMode.SLIDER_SLOW_FADE):
+        elif mode in (LightMode.AUTO_RGB_FADE, LightMode.SLIDER_SLOW_FADE, LightMode.STROBE):
             self._start_worker(mode)
         elif mode in (LightMode.BEAT_RGB_STEP, LightMode.FADE_SYNC_EVERY_4):
             # Beat-driven modes, nothing to send yet.
@@ -146,7 +150,7 @@ class LightController:
 
         if mode == LightMode.FADE_SYNC_EVERY_4:
             with self._lock:
-                self._beat_counter = (self._beat_counter + 1) % 4
+                self._beat_counter = (self._beat_counter + 1) % 8
                 beat_index = self._beat_counter
             if beat_index != 0:
                 return
@@ -184,6 +188,11 @@ class LightController:
                     fade_in = fade_out = self._slider_fade_duration_ms
                     wait_for = max(self._slider_fade_interval_sec, (fade_in + fade_out) / 1000.0)
                     self._send_rgb(color, fade_in=fade_in, fade_out=fade_out)
+                elif mode == LightMode.STROBE:
+                    with self._lock:
+                        color = self._color
+                    wait_for = self._strobe_interval_sec
+                    self._send_rgb(color, fade_in=self._strobe_fade_in_ms, fade_out=self._strobe_fade_out_ms)
                 else:
                     return
             except Exception as exc:  # pragma: no cover - defensive runtime log
