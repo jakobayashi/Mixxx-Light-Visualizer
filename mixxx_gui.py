@@ -10,9 +10,9 @@ from tkinter import ttk
 from typing import Optional
 
 import mido
-import serial
 import serial.tools.list_ports
 
+import light_controller
 import mixxx_listener
 
 
@@ -27,7 +27,9 @@ class MixxxGUI:
         self.last_beat_time: Optional[float] = None
         self.running = False
         self.listen_thread: Optional[threading.Thread] = None
-        self.serial_conn: Optional[serial.Serial] = None
+        self.light_controller = light_controller.LightController()
+        self.mode_var = tk.StringVar(value=light_controller.LightMode.OFF.value)
+        self.decay_var = tk.DoubleVar(value=1000.0)  # milliseconds
 
         self._build_ui()
         self.refresh_ports()
@@ -48,6 +50,7 @@ class MixxxGUI:
         ttk.Label(ports_frame, text="COM port").grid(row=1, column=0, sticky="w")
         self.com_combo = ttk.Combobox(ports_frame, state="readonly")
         self.com_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0))
+        self.com_combo.bind("<<ComboboxSelected>>", self._on_com_port_change)
 
         actions = ttk.Frame(ports_frame)
         actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
@@ -109,17 +112,61 @@ class MixxxGUI:
         self.send_btn = ttk.Button(led_frame, text="Send to COM port", command=self.send_rgb_to_serial)
         self.send_btn.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
 
+        mode_frame = ttk.LabelFrame(self.root, text="Mode")
+        mode_frame.grid(row=3, column=0, sticky="ew", **padding)
+        mode_options = [
+            ("Light on", light_controller.LightMode.ON.value),
+            ("Light off", light_controller.LightMode.OFF.value),
+            ("Light fade sync", light_controller.LightMode.FADE_SYNC.value),
+            ("Auto RGB fade (no beat)", light_controller.LightMode.AUTO_RGB_FADE.value),
+            ("Beat RGB step", light_controller.LightMode.BEAT_RGB_STEP.value),
+            ("Slider slow fade", light_controller.LightMode.SLIDER_SLOW_FADE.value),
+            ("Beat every 4th", light_controller.LightMode.FADE_SYNC_EVERY_4.value),
+        ]
+        for idx, (label, mode) in enumerate(mode_options):
+            row, col = divmod(idx, 3)
+            ttk.Radiobutton(
+                mode_frame,
+                text=label,
+                value=mode,
+                variable=self.mode_var,
+                command=self._on_mode_change,
+            ).grid(row=row, column=col, sticky="w", padx=(0, 8), pady=(0, 4))
+        for col in range(3):
+            mode_frame.columnconfigure(col, weight=1)
+
+        fade_frame = ttk.LabelFrame(self.root, text="Fade adjustments")
+        fade_frame.grid(row=4, column=0, sticky="ew", **padding)
+        ttk.Label(fade_frame, text="Decay (ms)").grid(row=0, column=0, sticky="w")
+        self.decay_label = ttk.Label(fade_frame, text=f"{int(self.decay_var.get())} ms")
+        self.decay_label.grid(row=0, column=2, sticky="e", padx=(8, 0))
+        decay_slider = tk.Scale(
+            fade_frame,
+            from_=0.0,
+            to=5000.0,
+            resolution=10.0,  # finer than 100ms
+            orient="horizontal",
+            variable=self.decay_var,
+            command=lambda val: self._on_decay_change(float(val)),
+            showvalue=False,
+        )
+        decay_slider.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        fade_frame.columnconfigure(1, weight=1)
+
         preview_frame = ttk.LabelFrame(self.root, text="RGB preview")
-        preview_frame.grid(row=3, column=0, sticky="ew", **padding)
+        preview_frame.grid(row=5, column=0, sticky="ew", **padding)
         for idx, color in enumerate(("R", "G", "B")):
             ttk.Label(preview_frame, text=f"{color}:").grid(row=0, column=idx * 2, sticky="e", padx=(0, 4))
             label = ttk.Label(preview_frame, text="0")
             label.grid(row=0, column=idx * 2 + 1, sticky="w")
-            self.rgb_value_labels[f"preview_{color}"] = label
+        self.rgb_value_labels[f"preview_{color}"] = label
 
         self.status_var = tk.StringVar(value="Idle")
         self.status_label = ttk.Label(self.root, textvariable=self.status_var, anchor="w")
-        self.status_label.grid(row=4, column=0, sticky="ew", **padding)
+        self.status_label.grid(row=6, column=0, sticky="ew", **padding)
+
+        # Initialize controller decay with slider value
+        self._on_decay_change(self.decay_var.get())
 
     def refresh_ports(self) -> None:
         midi_ports = ["<none>"] + mido.get_input_names()
@@ -160,6 +207,7 @@ class MixxxGUI:
                 while self.running:
                     for msg in port.iter_pending():
                         is_beat = msg.type == "note_on" and msg.note == mixxx_listener.NOTE_BEAT
+                        beat_bpm_hint: Optional[float] = None
                         self.decoder.handle(msg)
                         with self.state_lock:
                             st = self.decoder.state
@@ -170,6 +218,12 @@ class MixxxGUI:
                             }
                             if is_beat:
                                 self.last_beat_time = time.time()
+                                beat_bpm_hint = st.reported_bpm or st.calculated_bpm
+                        if is_beat:
+                            try:
+                                self.light_controller.handle_beat(beat_bpm_hint)
+                            except Exception as exc:
+                                self.root.after(0, lambda msg=f"Serial error: {exc}": self.set_status(msg))
                     time.sleep(0.01)
         except Exception as exc:
             self.root.after(0, lambda: self.set_status(f"Error: {exc}"))
@@ -210,8 +264,12 @@ class MixxxGUI:
         # Keep labels in sync for both side columns.
         clamped = max(0, min(int(value), 255))
         self.rgb_vars[color].set(clamped)
-        self.rgb_value_labels[color].config(text=str(clamped))
-        self.rgb_value_labels[f"preview_{color}"].config(text=str(clamped))
+        if color in self.rgb_value_labels:
+            self.rgb_value_labels[color].config(text=str(clamped))
+        preview_key = f"preview_{color}"
+        if preview_key in self.rgb_value_labels:
+            self.rgb_value_labels[preview_key].config(text=str(clamped))
+        self._update_controller_color()
 
     def _get_rgb_tuple(self) -> tuple[int, int, int]:
         return (
@@ -220,41 +278,92 @@ class MixxxGUI:
             self.rgb_vars["B"].get(),
         )
 
-    def _ensure_serial(self) -> bool:
-        """Open (and keep) a serial connection for RGB sends."""
-        if self.serial_conn and self.serial_conn.is_open:
-            return True
+    def _get_selected_com_port(self) -> Optional[str]:
+        port = self.com_combo.get()
+        if not port or port.startswith("<none"):
+            return None
+        return port
 
-        com_port = self.com_combo.get()
-        if not com_port or com_port.startswith("<none>"):
+    def _sync_com_port(self) -> bool:
+        port = self._get_selected_com_port()
+        if not port:
             self.set_status("Select a COM port first.")
             return False
-
         try:
-            ser = serial.Serial(com_port, 115200, timeout=1)
-            # Avoid toggling DTR after open; some boards reset on DTR changes.
-            try:
-                ser.dtr = False
-            except Exception:
-                pass
-            self.serial_conn = ser
-            self.set_status(f"Connected to {com_port}")
+            self.light_controller.set_com_port(port)
             return True
         except Exception as exc:
             self.set_status(f"Serial error: {exc}")
-            self.serial_conn = None
             return False
 
+    def _update_controller_color(self) -> None:
+        try:
+            self.light_controller.set_color(self._get_rgb_tuple())
+        except Exception as exc:
+            if self.mode_var.get() == light_controller.LightMode.ON.value:
+                self.set_status(f"Serial error: {exc}")
+
+    def _on_mode_change(self) -> None:
+        try:
+            mode = light_controller.LightMode(self.mode_var.get())
+        except ValueError:
+            return
+
+        if mode != light_controller.LightMode.OFF and not self._sync_com_port():
+            # Revert to off if we cannot talk to the lamp.
+            self.mode_var.set(light_controller.LightMode.OFF.value)
+            return
+
+        try:
+            self.light_controller.set_mode(mode)
+        except Exception as exc:
+            self.mode_var.set(light_controller.LightMode.OFF.value)
+            self.set_status(f"Serial error: {exc}")
+            return
+
+        if mode == light_controller.LightMode.OFF:
+            self.set_status("Light off")
+        elif mode == light_controller.LightMode.ON:
+            self.set_status("Light on (static)")
+        elif mode == light_controller.LightMode.FADE_SYNC:
+            self.set_status("Light fade sync on beat")
+        elif mode == light_controller.LightMode.AUTO_RGB_FADE:
+            self.set_status("Auto RGB fade cycling (no beat)")
+        elif mode == light_controller.LightMode.BEAT_RGB_STEP:
+            self.set_status("Beat-driven RGB sequence (R → G → B)")
+        elif mode == light_controller.LightMode.SLIDER_SLOW_FADE:
+            self.set_status("Slider color slow fade (no beat)")
+        elif mode == light_controller.LightMode.FADE_SYNC_EVERY_4:
+            self.set_status("Beat fade every 4th beat")
+
+    def _on_decay_change(self, value: float) -> None:
+        val = max(0.0, min(float(value), 5000.0))
+        self.decay_var.set(val)
+        self.decay_label.config(text=f"{int(val)} ms")
+        try:
+            self.light_controller.set_decay_ms(val)
+        except Exception as exc:
+            self.set_status(f"Serial error: {exc}")
+
+    def _on_com_port_change(self, _event=None) -> None:
+        port = self._get_selected_com_port()
+        if not port:
+            self.set_status("Select a COM port to control the light.")
+            return
+        try:
+            self.light_controller.set_com_port(port)
+            self.set_status(f"Using COM port {port}")
+        except Exception as exc:
+            self.set_status(f"Serial error: {exc}")
+
     def send_rgb_to_serial(self) -> None:
-        if not self._ensure_serial():
+        if not self._sync_com_port():
             return
 
         r, g, b = self._get_rgb_tuple()
-        cmd = f"RGB {r} {g} {b}\n".encode("ascii")
         try:
-            assert self.serial_conn is not None
-            self.serial_conn.write(cmd)
-            self.serial_conn.flush()
+            self.light_controller.set_color((r, g, b))
+            self.light_controller.send_static_color()
             self.set_status(f"Sent RGB {r},{g},{b}")
         except Exception as exc:
             self.set_status(f"Serial error: {exc}")
@@ -272,11 +381,10 @@ class MixxxGUI:
         self.running = False
         if self.listen_thread and self.listen_thread.is_alive():
             self.listen_thread.join(timeout=1.0)
-        if self.serial_conn and self.serial_conn.is_open:
-            try:
-                self.serial_conn.close()
-            except Exception:
-                pass
+        try:
+            self.light_controller.close()
+        except Exception:
+            pass
         self.root.destroy()
 
 
