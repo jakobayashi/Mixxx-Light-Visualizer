@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 import time
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import serial
 
@@ -19,12 +19,13 @@ class LightMode(Enum):
     BEAT_RGB_STEP = "beat_rgb_step"
     SLIDER_SLOW_FADE = "slider_slow_fade"
     FADE_SYNC_EVERY_4 = "fade_sync_every_4"
+    STROBE = "strobe"
 
 
 class LightController:
     """Handle serial LED commands and beat-synced fading (new on-device fade protocol)."""
 
-    def __init__(self, baudrate: int = 115200) -> None:
+    def __init__(self, baudrate: int = 115200, mirror: Optional[Any] = None) -> None:
         self._baudrate = baudrate
         self._com_port: Optional[str] = None
         self._serial: Optional[serial.Serial] = None
@@ -44,10 +45,15 @@ class LightController:
             (0, 0, 255),
         )
         self._cycle_interval_sec: float = 2.0
-        self._cycle_fade_in_ms: int = 800
-        self._cycle_fade_out_ms: int = 800
+        self._cycle_fade_in_ms: int = 2500
+        self._cycle_fade_out_ms: int = 2500
         self._slider_fade_interval_sec: float = 2.5
         self._slider_fade_duration_ms: int = 1200
+        self._strobe_interval_sec: float = 0.05
+        self._strobe_fade_in_ms: int = 0
+        self._strobe_fade_out_ms: int = 25
+        # Optional mirror that visualizes the outgoing commands (UI simulator).
+        self._mirror = mirror
 
     # ------------------------------ lifecycle ------------------------------ #
     def close(self) -> None:
@@ -73,6 +79,10 @@ class LightController:
             except Exception:
                 pass
 
+    def set_mirror(self, mirror: Optional[Any]) -> None:
+        """Update the mirror sink used to visualize outgoing serial commands."""
+        self._mirror = mirror
+
     # ------------------------------- commands ------------------------------ #
     def set_mode(self, mode: LightMode) -> None:
         self._stop_worker()
@@ -88,7 +98,7 @@ class LightController:
         elif mode == LightMode.FADE_SYNC:
             # No immediate action; beat pulses will trigger fades.
             pass
-        elif mode in (LightMode.AUTO_RGB_FADE, LightMode.SLIDER_SLOW_FADE):
+        elif mode in (LightMode.AUTO_RGB_FADE, LightMode.SLIDER_SLOW_FADE, LightMode.STROBE):
             self._start_worker(mode)
         elif mode in (LightMode.BEAT_RGB_STEP, LightMode.FADE_SYNC_EVERY_4):
             # Beat-driven modes, nothing to send yet.
@@ -146,7 +156,7 @@ class LightController:
 
         if mode == LightMode.FADE_SYNC_EVERY_4:
             with self._lock:
-                self._beat_counter = (self._beat_counter + 1) % 4
+                self._beat_counter = (self._beat_counter + 1) % 8
                 beat_index = self._beat_counter
             if beat_index != 0:
                 return
@@ -176,7 +186,7 @@ class LightController:
                     color = self._next_cycle_color()
                     fade_in = self._cycle_fade_in_ms
                     fade_out = self._cycle_fade_out_ms
-                    wait_for = max(self._cycle_interval_sec, (fade_in + fade_out) / 1000.0)
+                    wait_for = self._cycle_interval_sec
                     self._send_rgb(color, fade_in=fade_in, fade_out=fade_out)
                 elif mode == LightMode.SLIDER_SLOW_FADE:
                     with self._lock:
@@ -184,6 +194,11 @@ class LightController:
                     fade_in = fade_out = self._slider_fade_duration_ms
                     wait_for = max(self._slider_fade_interval_sec, (fade_in + fade_out) / 1000.0)
                     self._send_rgb(color, fade_in=fade_in, fade_out=fade_out)
+                elif mode == LightMode.STROBE:
+                    with self._lock:
+                        color = self._color
+                    wait_for = self._strobe_interval_sec
+                    self._send_rgb(color, fade_in=self._strobe_fade_in_ms, fade_out=self._strobe_fade_out_ms)
                 else:
                     return
             except Exception as exc:  # pragma: no cover - defensive runtime log
@@ -222,9 +237,19 @@ class LightController:
         fade_in = max(0, int(fade_in))
         fade_out = max(0, int(fade_out))
         cmd = f"RGB {int(r)} {int(g)} {int(b)} {fade_in} {fade_out}\n".encode("ascii")
+        if self._mirror:
+            try:
+                self._mirror.handle_rgb((int(r), int(g), int(b)), fade_in, fade_out)
+            except Exception as exc:  # pragma: no cover - UI helper should not kill serial
+                print(f"[light_controller {self._ts()}] mirror error (rgb): {exc}")
         self._write_line(cmd)
 
     def _send_off(self) -> None:
+        if self._mirror:
+            try:
+                self._mirror.handle_off()
+            except Exception as exc:  # pragma: no cover
+                print(f"[light_controller {self._ts()}] mirror error (off): {exc}")
         self._write_line(b"OFF\n")
 
     def _write_line(self, data: bytes) -> None:
